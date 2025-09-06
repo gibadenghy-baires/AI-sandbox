@@ -1,1 +1,971 @@
-
+{
+  "name": "Vision-SFDC Client-Contact Synching Agent - POC",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "8b1e4c8e-7f2a-4b3c-9d1e-2f3a4b5c6d7e",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Initialize sync session\nconst syncId = `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;\nconst timestamp = new Date().toISOString();\n\n// Set sync metadata\nreturn {\n  syncId,\n  timestamp,\n  status: 'started',\n  source: 'manual_trigger',\n  operation: 'bi_directional_sync'\n};"
+      },
+      "id": "9c2d5e8f-1a3b-4c5d-8e1f-3a4b5c6d7e8f",
+      "name": "Initialize Sync Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.VISION_GRAPHQL_ENDPOINT }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "query GetRecentClientContacts($limit: Int, $lastSyncTime: DateTime) {\n  clientContacts(limit: $limit, updatedAfter: $lastSyncTime) {\n    id\n    firstName\n    lastName\n    email\n    phone\n    title\n    clientId\n    client {\n      id\n      name\n    }\n    updatedAt\n    createdAt\n    isActive\n  }\n}"
+            },
+            {
+              "name": "variables",
+              "value": "{\n  \"limit\": 100,\n  \"lastSyncTime\": \"{{ $json.lastSyncTime || '2024-01-01T00:00:00Z' }}\"\n}"
+            }
+          ]
+        }
+      },
+      "id": "a3d6e9f2-2b4c-5d6e-9f2a-4b5c6d7e8f9a",
+      "name": "Fetch Vision Contacts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "vision_graphql_auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 100,
+        "options": {
+          "fields": [
+            "Id",
+            "FirstName",
+            "LastName",
+            "Email",
+            "Phone",
+            "Title",
+            "AccountId",
+            "Account.Name",
+            "LastModifiedDate",
+            "CreatedDate",
+            "Vision_ID__c"
+          ]
+        },
+        "conditions": {
+          "conditionsUi": {
+            "conditions": [
+              {
+                "field": "LastModifiedDate",
+                "operation": "greaterThan",
+                "value": "={{ $json.lastSyncTime || '2024-01-01T00:00:00.000Z' }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "b4e7f0a3-3c5d-6e7f-0a3b-5c6d7e8f9a0b",
+      "name": "Fetch Salesforce Contacts",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 2,
+      "position": [680, 400],
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "salesforce_oauth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Process Vision contacts and check for Salesforce matches\nconst visionContacts = $input.first()?.json?.data?.clientContacts || [];\nconst salesforceContacts = $input.all().find(item => item.node?.name === 'Fetch Salesforce Contacts')?.json || [];\n\nconst results = [];\n\n// Process Vision contacts\nfor (const visionContact of visionContacts) {\n  // Check if contact already has Salesforce ID in link map\n  const existingSfMatch = salesforceContacts.find(sf => \n    sf.Vision_ID__c === visionContact.id\n  );\n  \n  if (existingSfMatch) {\n    // Update existing link\n    results.push({\n      operation: 'update_existing',\n      source: 'vision',\n      visionId: visionContact.id,\n      salesforceId: existingSfMatch.Id,\n      visionData: visionContact,\n      salesforceData: existingSfMatch,\n      needsUpdate: new Date(visionContact.updatedAt) > new Date(existingSfMatch.LastModifiedDate)\n    });\n  } else {\n    // Check for potential matches by email/name\n    const potentialMatch = salesforceContacts.find(sf => \n      (sf.Email && sf.Email.toLowerCase() === visionContact.email?.toLowerCase()) ||\n      (sf.FirstName === visionContact.firstName && sf.LastName === visionContact.lastName)\n    );\n    \n    if (potentialMatch) {\n      results.push({\n        operation: 'create_link',\n        source: 'vision',\n        visionId: visionContact.id,\n        salesforceId: potentialMatch.Id,\n        visionData: visionContact,\n        salesforceData: potentialMatch,\n        confidence: 'high'\n      });\n    } else {\n      results.push({\n        operation: 'create_new',\n        source: 'vision',\n        visionId: visionContact.id,\n        visionData: visionContact,\n        needsCreation: true\n      });\n    }\n  }\n}\n\n// Process Salesforce contacts for reverse sync\nfor (const sfContact of salesforceContacts) {\n  if (!sfContact.Vision_ID__c) {\n    // Check for potential Vision matches\n    const potentialMatch = visionContacts.find(vision => \n      (vision.email && vision.email.toLowerCase() === sfContact.Email?.toLowerCase()) ||\n      (vision.firstName === sfContact.FirstName && vision.lastName === sfContact.LastName)\n    );\n    \n    if (potentialMatch && !results.find(r => r.visionId === potentialMatch.id)) {\n      results.push({\n        operation: 'create_link',\n        source: 'salesforce',\n        salesforceId: sfContact.Id,\n        visionId: potentialMatch.id,\n        salesforceData: sfContact,\n        visionData: potentialMatch,\n        confidence: 'high'\n      });\n    } else if (!potentialMatch) {\n      results.push({\n        operation: 'create_new',\n        source: 'salesforce',\n        salesforceId: sfContact.Id,\n        salesforceData: sfContact,\n        needsCreation: true\n      });\n    }\n  }\n}\n\nreturn results;"
+      },
+      "id": "c5f8a1b4-4d6e-7f8a-1b4c-6d7e8f9a0b1c",
+      "name": "Process and Match Contacts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "d6a9b2c5-5e7f-8a9b-2c5d-7e8f9a0b1c2d",
+              "leftValue": "={{ $json.operation }}",
+              "rightValue": "update_existing",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "d6a9b2c5-5e7f-8a9b-2c5d-7e8f9a0b1c2d",
+      "name": "Route: Update Existing",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 180]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "e7b0c3d6-6f8a-9b0c-3d6e-8f9a0b1c2d3e",
+              "leftValue": "={{ $json.operation }}",
+              "rightValue": "create_link",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "e7b0c3d6-6f8a-9b0c-3d6e-8f9a0b1c2d3e",
+      "name": "Route: Create Link",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "f8c1d4e7-7a9b-0c1d-4e7f-9a0b1c2d3e4f",
+              "leftValue": "={{ $json.operation }}",
+              "rightValue": "create_new",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "f8c1d4e7-7a9b-0c1d-4e7f-9a0b1c2d3e4f",
+      "name": "Route: Create New",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "a9d2e5f8-8b0c-1d2e-5f8a-0b1c2d3e4f5a",
+              "leftValue": "={{ $json.needsUpdate }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "a9d2e5f8-8b0c-1d2e-5f8a-0b1c2d3e4f5a",
+      "name": "Check if Update Needed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 180]
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "update",
+        "contactId": "={{ $json.salesforceId }}",
+        "updateFields": {
+          "customFieldsUi": {
+            "customFields": [
+              {
+                "fieldId": "Vision_ID__c",
+                "value": "={{ $json.visionId }}"
+              }
+            ]
+          },
+          "firstName": "={{ $json.visionData.firstName }}",
+          "lastName": "={{ $json.visionData.lastName }}",
+          "email": "={{ $json.visionData.email }}",
+          "phone": "={{ $json.visionData.phone }}",
+          "title": "={{ $json.visionData.title }}"
+        }
+      },
+      "id": "b0e3f6a9-9c1d-2e3f-6a9b-1c2d3e4f5a6b",
+      "name": "Update Salesforce Contact",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 2,
+      "position": [1560, 140],
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "salesforce_oauth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.VISION_GRAPHQL_ENDPOINT }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "mutation UpdateClientContact($id: ID!, $input: ClientContactUpdateInput!) {\n  updateClientContact(id: $id, input: $input) {\n    id\n    salesforceId\n    updatedAt\n  }\n}"
+            },
+            {
+              "name": "variables",
+              "value": "{\n  \"id\": \"{{ $json.visionId }}\",\n  \"input\": {\n    \"salesforceId\": \"{{ $json.salesforceId }}\",\n    \"firstName\": \"{{ $json.salesforceData.FirstName }}\",\n    \"lastName\": \"{{ $json.salesforceData.LastName }}\",\n    \"email\": \"{{ $json.salesforceData.Email }}\",\n    \"phone\": \"{{ $json.salesforceData.Phone }}\",\n    \"title\": \"{{ $json.salesforceData.Title }}\"\n  }\n}"
+            }
+          ]
+        }
+      },
+      "id": "c1f4a7b0-0d2e-3f4a-7b0c-2d3e4f5a6b7c",
+      "name": "Update Vision Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 220],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "vision_graphql_auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "update",
+        "contactId": "={{ $json.salesforceId }}",
+        "updateFields": {
+          "customFieldsUi": {
+            "customFields": [
+              {
+                "fieldId": "Vision_ID__c",
+                "value": "={{ $json.visionId }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "d2a5b8c1-1e3f-4a5b-8c1d-3e4f5a6b7c8d",
+      "name": "Create Link in Salesforce",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 2,
+      "position": [1340, 260],
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "salesforce_oauth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.VISION_GRAPHQL_ENDPOINT }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "mutation UpdateClientContact($id: ID!, $input: ClientContactUpdateInput!) {\n  updateClientContact(id: $id, input: $input) {\n    id\n    salesforceId\n    updatedAt\n  }\n}"
+            },
+            {
+              "name": "variables",
+              "value": "{\n  \"id\": \"{{ $json.visionId }}\",\n  \"input\": {\n    \"salesforceId\": \"{{ $json.salesforceId }}\"\n  }\n}"
+            }
+          ]
+        }
+      },
+      "id": "e3b6c9d2-2f4a-5b6c-9d2e-4f5a6b7c8d9e",
+      "name": "Create Link in Vision",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 340],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "vision_graphql_auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "f4c7d0e3-3a5b-6c7d-0e3f-5a6b7c8d9e0f",
+              "leftValue": "={{ $json.source }}",
+              "rightValue": "vision",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "f4c7d0e3-3a5b-6c7d-0e3f-5a6b7c8d9e0f",
+      "name": "Check Source: Vision",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 420]
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "create",
+        "firstName": "={{ $json.visionData.firstName }}",
+        "lastName": "={{ $json.visionData.lastName }}",
+        "additionalFields": {
+          "email": "={{ $json.visionData.email }}",
+          "phone": "={{ $json.visionData.phone }}",
+          "title": "={{ $json.visionData.title }}",
+          "customFieldsUi": {
+            "customFields": [
+              {
+                "fieldId": "Vision_ID__c",
+                "value": "={{ $json.visionId }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "a5d8e1f4-4b6c-7d8e-1f4a-6b7c8d9e0f1a",
+      "name": "Create New Salesforce Contact",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 2,
+      "position": [1560, 380],
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "salesforce_oauth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.VISION_GRAPHQL_ENDPOINT }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "mutation CreateClientContact($input: ClientContactCreateInput!) {\n  createClientContact(input: $input) {\n    id\n    salesforceId\n    firstName\n    lastName\n    email\n    createdAt\n  }\n}"
+            },
+            {
+              "name": "variables",
+              "value": "{\n  \"input\": {\n    \"firstName\": \"{{ $json.salesforceData.FirstName }}\",\n    \"lastName\": \"{{ $json.salesforceData.LastName }}\",\n    \"email\": \"{{ $json.salesforceData.Email }}\",\n    \"phone\": \"{{ $json.salesforceData.Phone }}\",\n    \"title\": \"{{ $json.salesforceData.Title }}\",\n    \"salesforceId\": \"{{ $json.salesforceId }}\"\n  }\n}"
+            }
+          ]
+        }
+      },
+      "id": "b6e9f2a5-5c7d-8e9f-2a5b-7c8d9e0f1a2b",
+      "name": "Create New Vision Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 460],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "vision_graphql_auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "claude-3-sonnet-20240229",
+        "messages": {
+          "messageValues": [
+            {
+              "role": "user",
+              "content": "Analyze these contact records for potential duplicates or data quality issues:\n\nVision Contact: {{ JSON.stringify($json.visionData, null, 2) }}\nSalesforce Contact: {{ JSON.stringify($json.salesforceData, null, 2) }}\n\nProvide recommendations for:\n1. Confidence level of the match (high/medium/low)\n2. Any data discrepancies that need attention\n3. Suggested field mappings or corrections\n4. Risk assessment for automatic syncing\n\nReturn response as JSON with fields: confidence, discrepancies, recommendations, riskLevel"
+            }
+          ]
+        }
+      },
+      "id": "c7f0a3b6-6d8e-9f0a-3b6c-8d9e0f1a2b3c",
+      "name": "Claude Agent: Match Analysis",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.3,
+      "position": [1120, 540],
+      "credentials": {
+        "openAiApi": {
+          "id": "claude_api"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Log sync operation\nconst logEntry = {\n  syncId: $('Initialize Sync Session').first()?.json?.syncId,\n  timestamp: new Date().toISOString(),\n  operation: $json.operation || 'unknown',\n  source: $json.source || 'unknown',\n  visionId: $json.visionId,\n  salesforceId: $json.salesforceId,\n  status: 'completed',\n  details: {\n    needsUpdate: $json.needsUpdate,\n    confidence: $json.confidence,\n    riskLevel: $json.riskLevel\n  }\n};\n\n// Add error information if present\nif ($json.error) {\n  logEntry.status = 'error';\n  logEntry.error = $json.error;\n}\n\nreturn logEntry;"
+      },
+      "id": "d8a1b4c7-7e9f-0a1b-4c7d-9e0f1a2b3c4d",
+      "name": "Create Audit Log Entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.AUDIT_LOG_ENDPOINT }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "logEntry",
+              "value": "={{ JSON.stringify($json) }}"
+            }
+          ]
+        }
+      },
+      "id": "e9b2c5d8-8f0a-1b2c-5d8e-0f1a2b3c4d5e",
+      "name": "Store Audit Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "audit_log_auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Generate sync summary report\nconst allResults = $input.all();\nconst summary = {\n  syncId: $('Initialize Sync Session').first()?.json?.syncId,\n  timestamp: new Date().toISOString(),\n  totalProcessed: allResults.length,\n  operations: {\n    updated: allResults.filter(r => r.json?.operation === 'update_existing').length,\n    linked: allResults.filter(r => r.json?.operation === 'create_link').length,\n    created: allResults.filter(r => r.json?.operation === 'create_new').length\n  },\n  errors: allResults.filter(r => r.json?.error).length,\n  warnings: allResults.filter(r => r.json?.riskLevel === 'high').length\n};\n\nreturn summary;"
+      },
+      "id": "f0c3d6e9-9a1b-2c3d-6e9f-1a2b3c4d5e6f",
+      "name": "Generate Sync Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "🔄 Vision-SFDC Sync Completed\\n\\n*Sync ID:* {{ $json.syncId }}\\n*Total Processed:* {{ $json.totalProcessed }}\\n*Updated:* {{ $json.operations.updated }}\\n*Linked:* {{ $json.operations.linked }}\\n*Created:* {{ $json.operations.created }}\\n*Errors:* {{ $json.errors }}\\n*Warnings:* {{ $json.warnings }}\\n\\n{{ $json.errors > 0 ? '⚠️ Check error queue for details' : '✅ All operations completed successfully' }}"
+            }
+          ]
+        }
+      },
+      "id": "a1d4e7f0-0b2c-3d4e-7f0a-2b3c4d5e6f7a",
+      "name": "Send Slack Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 300]
+    },
+    {
+      "parameters": {},
+      "id": "b2e5f8a1-1c3d-4e5f-8a1b-3c4d5e6f7a8b",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 600]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Process error and create retry entry\nconst error = $json.error || {};\nconst errorEntry = {\n  errorId: `error_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,\n  timestamp: new Date().toISOString(),\n  syncId: $('Initialize Sync Session').first()?.json?.syncId || 'unknown',\n  nodeName: error.node?.name || 'unknown',\n  errorMessage: error.message || 'Unknown error',\n  errorStack: error.stack,\n  inputData: $json,\n  retryCount: 0,\n  maxRetries: 3,\n  nextRetry: new Date(Date.now() + 5 * 60 * 1000).toISOString(),\n  status: 'pending_retry'\n};\n\nreturn errorEntry;"
+      },
+      "id": "c3f6a9b2-2d4e-5f6a-9b2c-4d5e6f7a8b9c",
+      "name": "Process Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 600]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.ERROR_QUEUE_ENDPOINT }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "errorEntry",
+              "value": "={{ JSON.stringify($json) }}"
+            }
+          ]
+        }
+      },
+      "id": "d4a7b0c3-3e5f-6a7b-0c3d-5e6f7a8b9c0d",
+      "name": "Add to Error Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 600],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "error_queue_auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "🚨 Vision-SFDC Sync Error\\n\\n*Error ID:* {{ $json.errorId }}\\n*Node:* {{ $json.nodeName }}\\n*Message:* {{ $json.errorMessage }}\\n*Sync ID:* {{ $json.syncId }}\\n*Next Retry:* {{ $json.nextRetry }}\\n\\n⚠️ Error has been added to retry queue"
+            }
+          ]
+        }
+      },
+      "id": "e5b8c1d4-4f6a-7b8c-1d4e-6f7a8b9c0d1e",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 600]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Rollback placeholder - implement based on operation type\nconst rollbackActions = {\n  update_existing: 'Revert field updates using backup data',\n  create_link: 'Remove link mappings from both systems',\n  create_new: 'Mark records for deletion or set inactive flag'\n};\n\nconst rollbackPlan = {\n  rollbackId: `rollback_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,\n  timestamp: new Date().toISOString(),\n  syncId: $json.syncId,\n  operation: $json.operation,\n  action: rollbackActions[$json.operation] || 'Manual intervention required',\n  affectedRecords: {\n    visionId: $json.visionId,\n    salesforceId: $json.salesforceId\n  },\n  status: 'planned'\n};\n\nreturn rollbackPlan;"
+      },
+      "id": "f6c9d2e5-5a7b-8c9d-2e5f-7a8b9c0d1e2f",
+      "name": "Rollback Planner",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 600]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Initialize Sync Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize Sync Session": {
+      "main": [
+        [
+          {
+            "node": "Fetch Vision Contacts",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Salesforce Contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Vision Contacts": {
+      "main": [
+        [
+          {
+            "node": "Process and Match Contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Salesforce Contacts": {
+      "main": [
+        [
+          {
+            "node": "Process and Match Contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process and Match Contacts": {
+      "main": [
+        [
+          {
+            "node": "Route: Update Existing",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Route: Create Link",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Route: Create New",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Claude Agent: Match Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route: Update Existing": {
+      "main": [
+        [
+          {
+            "node": "Check if Update Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route: Create Link": {
+      "main": [
+        [
+          {
+            "node": "Create Link in Salesforce",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Create Link in Vision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route: Create New": {
+      "main": [
+        [
+          {
+            "node": "Check Source: Vision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if Update Needed": {
+      "main": [
+        [
+          {
+            "node": "Update Salesforce Contact",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Update Vision Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Salesforce Contact": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Vision Contact": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Link in Salesforce": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Link in Vision": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Source: Vision": {
+      "main": [
+        [
+          {
+            "node": "Create New Salesforce Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create New Vision Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create New Salesforce Contact": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create New Vision Contact": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Agent: Match Analysis": {
+      "main": [
+        [
+          {
+            "node": "Create Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Audit Log Entry": {
+      "main": [
+        [
+          {
+            "node": "Store Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Audit Log": {
+      "main": [
+        [
+          {
+            "node": "Generate Sync Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Sync Summary": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Process Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Error": {
+      "main": [
+        [
+          {
+            "node": "Add to Error Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add to Error Queue": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Error Alert": {
+      "main": [
+        [
+          {
+            "node": "Rollback Planner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "00000000-0000-0000-0000-000000000000",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "00000000000000000000000000000000"
+  },
+  "id": "00000000-0000-0000-0000-000000000000",
+  "tags": []
+}
